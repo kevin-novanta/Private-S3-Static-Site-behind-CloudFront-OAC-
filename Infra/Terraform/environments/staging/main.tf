@@ -1,6 +1,6 @@
 module "static_site" {
     source = "../../modules/cloudfront_oac"
-    projet_name = var.project_name
+    project_name = var.project_name
     domain_name = var.domain_name
     cdn_domain = var.cdn_domain
     price_class = var.price_class
