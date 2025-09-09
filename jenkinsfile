@@ -131,22 +131,29 @@ printf 'BUCKET=%s\nDISTID=%s\nCDN=%s\nENV_DIR=%s\n' \
 '''
         // Read and sanitize without readProperties (strip ANSI & non-printables)
         script {
-          def ansiStrip = { s ->
-            if (s == null) return s
+          def strip = { s ->
+            if (s == null) return ''
             s.replaceAll(/\u001B\[[;\d]*m/, '')
              .replaceAll(/[^\x20-\x7E]/, '')
              .trim()
           }
-
-          def text = readFile 'env.out'
-          text.split('\n').each { line ->
+        
+          def props = [:]
+          readFile('env.out').split('\n').each { line ->
             if (line?.trim() && line.contains('=')) {
               def idx = line.indexOf('=')
-              def k = line.substring(0, idx)
-              def v = line.substring(idx + 1)
-              env[k] = ansiStrip(v)
+              def key = line.substring(0, idx)
+              def val = line.substring(idx + 1)
+              props[key] = val
             }
           }
+        
+          // Assign explicitly to avoid sandbox blocking dynamic env[k] writes
+          env.BUCKET  = strip(props['BUCKET'])
+          env.DISTID  = strip(props['DISTID'])
+          env.CDN     = strip(props['CDN'])
+          env.ENV_DIR = strip(props['ENV_DIR'] ?: env.ENV_DIR)
+        
           echo "Resolved: bucket=${env.BUCKET}, dist=${env.DISTID}, cdn=${env.CDN}, envdir=${env.ENV_DIR}"
         }
       }
