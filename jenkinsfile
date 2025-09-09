@@ -1,42 +1,70 @@
 pipeline {
   agent any
 
+  options {
+    timestamps()
+    ansiColor('xterm')
+  }
+
+  stage('Register Parameters') {
+    steps {
+        script {
+            properties {[
+                parameters([
+                    choice(name: 'ENV',
+                    choices: ['staging', 'prod'].join('\n'),
+                    description: 'Which environment to deploy?')
+                ])
+            ]}
+        }
+    }
+  }
+
   environment {
     AWS_REGION = 'us-east-1'
-    AWS_ACCESS_KEY_ID     = credentials('aws-staging-access-key-id')
-    AWS_SECRET_ACCESS_KEY = credentials('aws-staging-secret-access-key')
   }
 
   stages {
+
     stage('Checkout') {
-      steps { checkout scm }
+      steps {
+        checkout scm
+        echo "Branch: ${env.GIT_BRANCH ?: 'unknown'} | Commit: ${env.GIT_COMMIT ?: 'unknown'}"
+      }
     }
 
     stage('Tools (aws + terraform)') {
       steps {
         sh '''
-          set -e
-          if ! command -v unzip >/dev/null 2>&1; then sudo apt-get update -y && sudo apt-get install -y unzip curl jq; fi
+          set -euo pipefail
+          if ! command -v unzip >/dev/null 2>&1; then
+            sudo apt-get update -y && sudo apt-get install -y unzip curl jq
+          fi
 
-          # AWS CLI v2
+          # AWS CLI v2 (arch-aware)
           if ! command -v aws >/dev/null 2>&1; then
-            curl -sS "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o awscliv2.zip || \
-            curl -sS "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
+            ARCH=$(uname -m)
+            if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; then
+              DL=https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
+            else
+              DL=https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip
+            fi
+            curl -sS "$DL" -o awscliv2.zip
             unzip -q awscliv2.zip
             sudo ./aws/install
             aws --version
           fi
 
-          # Terraform (single binary install)
+          # Terraform (single-binary install)
           if ! command -v terraform >/dev/null 2>&1; then
             TF_VERSION=1.8.5
             ARCH=$(uname -m)
             case "$ARCH" in
-              x86_64) TF_ZIP="terraform_${TF_VERSION}_linux_amd64.zip" ;;
+              x86_64|amd64) TF_ZIP="terraform_${TF_VERSION}_linux_amd64.zip" ;;
               aarch64|arm64) TF_ZIP="terraform_${TF_VERSION}_linux_arm64.zip" ;;
               *) echo "Unsupported arch $ARCH"; exit 1 ;;
             esac
-            curl -sS -L "https://releases.hashicorp.com/terraform/${TF_VERSION}/${TF_ZIP}" -o tf.zip
+            curl -sSL "https://releases.hashicorp.com/terraform/${TF_VERSION}/${TF_ZIP}" -o tf.zip
             sudo unzip -o tf.zip -d /usr/local/bin
             terraform -version
           fi
@@ -44,49 +72,69 @@ pipeline {
       }
     }
 
-    stage('Resolve Terraform outputs') {
+    stage('Terraform outputs') {
       steps {
+        script {
+          env.ENV_DIR = "Infra/Terraform/environments/${params.ENV}"
+        }
         sh '''
-          set -e
-          cd Infra/Terraform/environments/staging
+          set -euo pipefail
+          cd "${ENV_DIR}"
           terraform init -input=false -upgrade
-          echo "BUCKET=$(terraform output -raw s3_bucket_name)" >  $WORKSPACE/env.out
-          echo "DISTID=$(terraform output -raw cloudfront_distribution_id)" >> $WORKSPACE/env.out
-          echo "CDN=$(terraform output -raw cdn_url)" >> $WORKSPACE/env.out
+          echo "BUCKET=$(terraform output -raw s3_bucket_name)"                 >  "$WORKSPACE/env.out"
+          echo "DISTID=$(terraform output -raw cloudfront_distribution_id)"    >> "$WORKSPACE/env.out"
+          echo "CDN=$(terraform output -raw cdn_url)"                          >> "$WORKSPACE/env.out"
+          echo "ENV_DIR=${ENV_DIR}"                                            >> "$WORKSPACE/env.out"
         '''
         script {
           def props = readProperties file: 'env.out'
-          env.BUCKET = props['BUCKET']
-          env.DISTID = props['DISTID']
-          env.CDN    = props['CDN']
+          env.BUCKET  = props['BUCKET']
+          env.DISTID  = props['DISTID']
+          env.CDN     = props['CDN']
+          env.ENV_DIR = props['ENV_DIR']
+          echo "Resolved: bucket=${env.BUCKET}, dist=${env.DISTID}, cdn=${env.CDN}, envdir=${env.ENV_DIR}"
         }
       }
     }
 
-    stage('Sync site to S3') {
+    stage('Deploy (sync + invalidate + smoke)') {
       steps {
-        sh 'aws s3 sync site/ "s3://${BUCKET}" --delete'
-      }
-    }
+        script {
+          // Choose credentials per environment. You already created staging IDs.
+          // If you add prod later, create matching Jenkins credentials with these IDs.
+          def keyIdId     = (params.ENV == 'prod') ? 'aws-prod-access-key-id'           : 'aws-staging-access-key-id'
+          def secretKeyId = (params.ENV == 'prod') ? 'aws-prod-secret-access-key'       : 'aws-staging-secret-access-key'
 
-    stage('Invalidate CloudFront') {
-      steps {
-        sh 'aws cloudfront create-invalidation --distribution-id "$DISTID" --paths "/*"'
-      }
-    }
+          withCredentials([
+            string(credentialsId: keyIdId,     variable: 'AWS_ACCESS_KEY_ID'),
+            string(credentialsId: secretKeyId, variable: 'AWS_SECRET_ACCESS_KEY')
+          ]) {
+            sh '''
+              set -euo pipefail
+              aws s3 sync site/ "s3://${BUCKET}" --delete
 
-    stage('Smoke Test') {
-      steps {
-        sh '''
-          chmod +x Scripts/smoke.sh
-          CDN_HOST="${CDN#https://}" SITE_BUCKET="$BUCKET" DIST_ID="$DISTID" ./Scripts/smoke.sh
-        '''
+              aws cloudfront create-invalidation \
+                --distribution-id "$DISTID" \
+                --paths "/*"
+
+              chmod +x Scripts/smoke.sh
+              CDN_HOST="${CDN#https://}" SITE_BUCKET="$BUCKET" DIST_ID="$DISTID" ./Scripts/smoke.sh | tee smoke.log
+            '''
+          }
+        }
       }
     }
   }
 
   post {
-    success { echo '✅ Deploy + smoke passed' }
-    failure { echo '❌ Pipeline failed — check stage logs' }
+    always {
+      archiveArtifacts artifacts: 'smoke.log', onlyIfSuccessful: false, allowEmptyArchive: true
+    }
+    success {
+      echo "✅ ${params.ENV} deploy & smoke passed"
+    }
+    failure {
+      echo "❌ ${params.ENV} deploy failed — see stage logs"
+    }
   }
 }
