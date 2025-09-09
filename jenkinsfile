@@ -36,7 +36,8 @@ pipeline {
     stage('Tools (aws + terraform)') {
       steps {
         sh '''
-          set -euo pipefail
+#!/usr/bin/env bash
+set -euo pipefail
           if ! command -v unzip >/dev/null 2>&1; then
             sudo apt-get update -y && sudo apt-get install -y unzip curl jq
           fi
@@ -78,8 +79,9 @@ pipeline {
           env.ENV_DIR = "Infra/Terraform/environments/${params.ENV}"
         }
         sh '''
-          set -euo pipefail
-          cd "${ENV_DIR}"
+#!/usr/bin/env bash
+set -euo pipefail
+cd "${ENV_DIR}"
           terraform init -input=false -upgrade
           echo "BUCKET=$(terraform output -raw s3_bucket_name)"                 >  "$WORKSPACE/env.out"
           echo "DISTID=$(terraform output -raw cloudfront_distribution_id)"    >> "$WORKSPACE/env.out"
@@ -110,7 +112,8 @@ pipeline {
             string(credentialsId: secretKeyId, variable: 'AWS_SECRET_ACCESS_KEY')
           ]) {
             sh '''
-              set -euo pipefail
+#!/usr/bin/env bash
+set -euo pipefail
               aws s3 sync site/ "s3://${BUCKET}" --delete
 
               aws cloudfront create-invalidation \
