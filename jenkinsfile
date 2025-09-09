@@ -6,25 +6,26 @@ pipeline {
     ansiColor('xterm')
   }
 
-  stage('Register Parameters') {
-    steps {
-        script {
-            properties {[
-                parameters([
-                    choice(name: 'ENV',
-                    choices: ['staging', 'prod'].join('\n'),
-                    description: 'Which environment to deploy?')
-                ])
-            ]}
-        }
-    }
-  }
-
   environment {
     AWS_REGION = 'us-east-1'
   }
 
   stages {
+    stage('Register Parameters') {
+      steps {
+        script {
+          properties([
+            parameters([
+              choice(
+                name: 'ENV',
+                choices: ['staging','prod'].join('\n'),
+                description: 'Which environment to deploy?'
+              )
+            ])
+          ])
+        }
+      }
+    }
 
     stage('Checkout') {
       steps {
