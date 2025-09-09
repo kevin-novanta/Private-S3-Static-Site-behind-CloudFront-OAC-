@@ -37,7 +37,7 @@ pipeline {
             branch: 'main'
             // If the repo is private, add: credentialsId: 'your-github-creds-id'
 
-        sh label: 'Show branch & commit', shell: '/bin/bash', script: '''
+        sh label: 'Show branch & commit', script: '''#!/usr/bin/env bash
 set -euo pipefail
 BRANCH=$(git rev-parse --abbrev-ref HEAD || echo unknown)
 COMMIT=$(git rev-parse --short HEAD || echo unknown)
@@ -48,7 +48,7 @@ echo "Branch: ${BRANCH} | Commit: ${COMMIT}"
 
     stage('Tools (aws + terraform)') {
       steps {
-        sh shell: '/bin/bash', script: '''
+        sh script: '''#!/usr/bin/env bash
 set -euo pipefail
           if ! command -v unzip >/dev/null 2>&1; then
             sudo apt-get update -y && sudo apt-get install -y unzip curl jq
@@ -90,7 +90,7 @@ set -euo pipefail
         script {
           env.ENV_DIR = "Infra/Terraform/environments/${params.ENV}"
         }
-        sh shell: '/bin/bash', script: '''
+        sh script: '''#!/usr/bin/env bash
 set -euo pipefail
 cd "${ENV_DIR}"
           terraform init -input=false -upgrade
@@ -122,7 +122,7 @@ cd "${ENV_DIR}"
             string(credentialsId: keyIdId,     variable: 'AWS_ACCESS_KEY_ID'),
             string(credentialsId: secretKeyId, variable: 'AWS_SECRET_ACCESS_KEY')
           ]) {
-            sh shell: '/bin/bash', script: '''
+            sh script: '''#!/usr/bin/env bash
 set -euo pipefail
               aws s3 sync site/ "s3://${BUCKET}" --delete
 
