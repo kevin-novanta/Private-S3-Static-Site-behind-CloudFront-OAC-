@@ -50,38 +50,58 @@ echo "Branch: ${BRANCH} | Commit: ${COMMIT}"
       steps {
         sh script: '''#!/usr/bin/env bash
 set -euo pipefail
-          if ! command -v unzip >/dev/null 2>&1; then
-            sudo apt-get update -y && sudo apt-get install -y unzip curl jq
-          fi
+export PATH="$WORKSPACE/.local/bin:$PATH"
 
-          # AWS CLI v2 (arch-aware)
-          if ! command -v aws >/dev/null 2>&1; then
-            ARCH=$(uname -m)
-            if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; then
-              DL=https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
-            else
-              DL=https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip
-            fi
-            curl -sS "$DL" -o awscliv2.zip
-            unzip -q awscliv2.zip
-            sudo ./aws/install
-            aws --version
-          fi
+# Ensure local bin exists (non-root friendly install location)
+mkdir -p "$WORKSPACE/.local/bin" "$WORKSPACE/.local/aws"
 
-          # Terraform (single-binary install)
-          if ! command -v terraform >/dev/null 2>&1; then
-            TF_VERSION=1.8.5
-            ARCH=$(uname -m)
-            case "$ARCH" in
-              x86_64|amd64) TF_ZIP="terraform_${TF_VERSION}_linux_amd64.zip" ;;
-              aarch64|arm64) TF_ZIP="terraform_${TF_VERSION}_linux_arm64.zip" ;;
-              *) echo "Unsupported arch $ARCH"; exit 1 ;;
-            esac
-            curl -sSL "https://releases.hashicorp.com/terraform/${TF_VERSION}/${TF_ZIP}" -o tf.zip
-            sudo unzip -o tf.zip -d /usr/local/bin
-            terraform -version
-          fi
-        '''
+# Basic packages only if we have apt and permissions; otherwise skip
+if command -v apt-get >/dev/null 2>&1 && [ "$(id -u)" -eq 0 ]; then
+  apt-get update -y && apt-get install -y unzip curl jq
+fi
+
+# Fallback: download jq locally if missing
+if ! command -v jq >/dev/null 2>&1; then
+  ARCH=$(uname -m)
+  case "$ARCH" in
+    x86_64|amd64) JQ_URL="https://github.com/stedolan/jq/releases/download/jq-1.6/jq-linux64" ;;
+    aarch64|arm64) JQ_URL="https://github.com/stedolan/jq/releases/download/jq-1.6/jq-linux64" ;;
+    *) echo "Warning: unknown arch $ARCH for jq; skipping" ; JQ_URL="" ;;
+  esac
+  if [ -n "$JQ_URL" ]; then
+    curl -fsSL "$JQ_URL" -o "$WORKSPACE/.local/bin/jq" && chmod +x "$WORKSPACE/.local/bin/jq"
+  fi
+fi
+
+# AWS CLI v2 — install locally (no sudo required)
+if ! command -v aws >/dev/null 2>&1; then
+  ARCH=$(uname -m)
+  if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; then
+    DL=https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
+  else
+    DL=https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip
+  fi
+  curl -fsSL "$DL" -o awscliv2.zip
+  rm -rf aws || true
+  unzip -q awscliv2.zip
+  ./aws/install -i "$WORKSPACE/.local/aws" -b "$WORKSPACE/.local/bin"
+  aws --version
+fi
+
+# Terraform — install locally (no sudo required)
+if ! command -v terraform >/dev/null 2>&1; then
+  TF_VERSION=1.8.5
+  ARCH=$(uname -m)
+  case "$ARCH" in
+    x86_64|amd64) TF_ZIP="terraform_${TF_VERSION}_linux_amd64.zip" ;;
+    aarch64|arm64) TF_ZIP="terraform_${TF_VERSION}_linux_arm64.zip" ;;
+    *) echo "Unsupported arch $ARCH"; exit 1 ;;
+  esac
+  curl -fsSL "https://releases.hashicorp.com/terraform/${TF_VERSION}/${TF_ZIP}" -o tf.zip
+  unzip -o tf.zip -d "$WORKSPACE/.local/bin"
+  terraform -version
+fi
+'''
       }
     }
 
@@ -92,6 +112,7 @@ set -euo pipefail
         }
         sh script: '''#!/usr/bin/env bash
 set -euo pipefail
+export PATH="$WORKSPACE/.local/bin:$PATH"
 cd "${ENV_DIR}"
           terraform init -input=false -upgrade
           echo "BUCKET=$(terraform output -raw s3_bucket_name)"                 >  "$WORKSPACE/env.out"
@@ -124,6 +145,7 @@ cd "${ENV_DIR}"
           ]) {
             sh script: '''#!/usr/bin/env bash
 set -euo pipefail
+export PATH="$WORKSPACE/.local/bin:$PATH"
               aws s3 sync site/ "s3://${BUCKET}" --delete
 
               aws cloudfront create-invalidation \
