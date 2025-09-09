@@ -17,3 +17,7 @@ terraform.rc
 **/.terraform/
 **/.terraform/
 **/terraform.tfstate*
+
+# Ignore study/notes docs
+Infra/Terraform/environments/staging/Doc 1 — What All the Files in staging (files) Do (from my perspective).md
+Infra/Terraform/modules/cloudfront_oac/Doc 2 — What All the Files in cloudfront_oac (files) Do (from my perspective).md
