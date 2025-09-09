@@ -29,8 +29,21 @@ pipeline {
 
     stage('Checkout') {
       steps {
-        checkout scm
-        echo "Branch: ${env.GIT_BRANCH ?: 'unknown'} | Commit: ${env.GIT_COMMIT ?: 'unknown'}"
+        // Start with a clean workspace to avoid half-initialized .git dirs
+        deleteDir()
+
+        // Explicit checkout avoids implicit lightweight behavior quirks
+        git url: 'https://github.com/kevin-novanta/Private-S3-Static-Site-behind-CloudFront-OAC-',
+            branch: 'main'
+            // If the repo is private, add: credentialsId: 'your-github-creds-id'
+
+        sh label: 'Show branch & commit', script: '''
+#!/usr/bin/env bash
+set -euo pipefail
+BRANCH=$(git rev-parse --abbrev-ref HEAD || echo unknown)
+COMMIT=$(git rev-parse --short HEAD || echo unknown)
+echo "Branch: ${BRANCH} | Commit: ${COMMIT}"
+'''
       }
     }
 
