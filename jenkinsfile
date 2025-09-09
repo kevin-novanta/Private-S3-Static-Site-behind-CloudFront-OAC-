@@ -8,6 +8,7 @@ pipeline {
 
   environment {
     AWS_REGION = 'us-east-1'
+    AWS_DEFAULT_REGION = 'us-east-1'
     TF_CLI_ARGS = '-no-color'
   }
 
@@ -107,70 +108,70 @@ fi
     }
 
     stage('Terraform outputs') {
-      steps {
-        script {
-          env.ENV_DIR = "Infra/Terraform/environments/${params.ENV}"
-        }
-        sh script: '''#!/usr/bin/env bash
+  steps {
+    script {
+      env.ENV_DIR = "Infra/Terraform/environments/${params.ENV}"
+    }
+    sh script: '''#!/usr/bin/env bash
 set -euo pipefail
 export PATH="$WORKSPACE/.local/bin:$PATH"
-# Force no color from Terraform as well
 export TF_CLI_ARGS="-no-color"
 
 cd "${ENV_DIR}"
 terraform init -input=false -upgrade 1>&2
 
-# Capture raw outputs (no color)
-BUCKET="$(terraform output -raw s3_bucket_name)"
-DISTID="$(terraform output -raw cloudfront_distribution_id)"
-CDN="$(terraform output -raw cdn_url)"
+# Export outputs to JSON, then to simple key=value properties
+terraform output -json > tf-outputs.json
 
-# Write a simple env file
-printf 'BUCKET=%s\nDISTID=%s\nCDN=%s\nENV_DIR=%s\n' \
-  "$BUCKET" "$DISTID" "$CDN" "${ENV_DIR}" > "$WORKSPACE/env.out"
+# Expecting keys: s3_bucket_name, cloudfront_distribution_id, and either cdn_hostname or cdn_url
+jq -r '
+  to_entries
+  | map("\\(.key)=\\(.value.value)")
+  | .[]
+' tf-outputs.json > tf-out.properties
+
+# Move properties file to workspace root for Jenkins steps
+cp tf-out.properties "$WORKSPACE/tf-out.properties"
 '''
-        // Read and sanitize without readProperties (strip ANSI & non-printables)
-        script {
-          def strip = { s ->
-            if (s == null) return ''
-            s.replaceAll(/\u001B\[[;\d]*m/, '')
-             .replaceAll(/[^\x20-\x7E]/, '')
-             .trim()
-          }
-        
-          def props = [:]
-          readFile('env.out').split('\n').each { line ->
-            if (line?.trim() && line.contains('=')) {
-              def idx = line.indexOf('=')
-              def key = line.substring(0, idx)
-              def val = line.substring(idx + 1)
-              props[key] = val
-            }
-          }
-        
-          // Assign explicitly to avoid sandbox blocking dynamic env[k] writes
-          env.BUCKET  = strip(props['BUCKET'])
-          env.DISTID  = strip(props['DISTID'])
-          env.CDN     = strip(props['CDN'])
-          env.ENV_DIR = strip(props['ENV_DIR'] ?: env.ENV_DIR)
-        
-          echo "Resolved: bucket=${env.BUCKET}, dist=${env.DISTID}, cdn=${env.CDN}, envdir=${env.ENV_DIR}"
+    // Read properties into env vars
+    script {
+      def props = readProperties file: 'tf-out.properties'
+
+      // prefer cdn_hostname; fall back to cdn_url
+      def cdnHost = (props['cdn_hostname'] ?: '').trim()
+      if (!cdnHost) {
+        def cdnUrl = (props['cdn_url'] ?: '').trim()
+        if (cdnUrl) {
+          cdnHost = cdnUrl.replaceFirst('^https?://', '').replaceAll('/$', '')
         }
       }
+
+      env.SITE_BUCKET = (props['s3_bucket_name'] ?: '').trim()
+      env.DIST_ID     = (props['cloudfront_distribution_id'] ?: '').trim()
+      env.CDN_HOST    = cdnHost
+
+      echo "Resolved: bucket=${env.SITE_BUCKET}, dist=${env.DIST_ID}, cdn=${env.CDN_HOST}, envdir=${env.ENV_DIR}"
     }
+  }
+  post {
+    always {
+      archiveArtifacts artifacts: 'tf-outputs.json, tf-out.properties', onlyIfSuccessful: false, allowEmptyArchive: true
+    }
+  }
+}
 
     stage('Deploy (sync + invalidate + smoke)') {
       steps {
         script {
-          // Sanity checks to avoid bad values slipping through
-          if (!(env.BUCKET ==~ "^[a-z0-9.\\-_]{3,255}\$")) {
-            error "S3 bucket name looks invalid: '${env.BUCKET}'"
+          // Sanity checks
+          if (!(env.SITE_BUCKET ==~ "^[a-z0-9.\\-_]{3,255}$")) {
+            error "S3 bucket name looks invalid: '${env.SITE_BUCKET}'"
           }
-          if (!(env.CDN?.startsWith('https://'))) {
-            error "CDN URL looks invalid: '${env.CDN}'"
+          if (!(env.DIST_ID ==~ "^[A-Z0-9]{13,}$")) {
+            error "Distribution ID looks invalid: '${env.DIST_ID}'"
           }
-          if (!(env.DISTID ==~ "^[A-Z0-9]{13,}\$")) {
-            error "Distribution ID looks invalid: '${env.DISTID}'"
+          if (!env.CDN_HOST || !(env.CDN_HOST ==~ "^[A-Za-z0-9.-]+\$")) {
+            error "CDN host looks invalid: '${env.CDN_HOST}'"
           }
 
           // Choose credentials per environment. You already created staging IDs.
@@ -184,15 +185,17 @@ printf 'BUCKET=%s\nDISTID=%s\nCDN=%s\nENV_DIR=%s\n' \
             sh script: '''#!/usr/bin/env bash
 set -euo pipefail
 export PATH="$WORKSPACE/.local/bin:$PATH"
-              aws s3 sync site/ "s3://${BUCKET}" --delete
+export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
 
-              aws cloudfront create-invalidation \
-                --distribution-id "$DISTID" \
-                --paths "/*"
+aws s3 sync site/ "s3://${SITE_BUCKET}" --delete
 
-              chmod +x Scripts/smoke.sh
-              CDN_HOST="${CDN#https://}" SITE_BUCKET="$BUCKET" DIST_ID="$DISTID" ./Scripts/smoke.sh | tee smoke.log
-            '''
+aws cloudfront create-invalidation \
+  --distribution-id "$DIST_ID" \
+  --paths "/*"
+
+chmod +x Scripts/smoke.sh
+CDN_HOST="${CDN_HOST}" SITE_BUCKET="$SITE_BUCKET" DIST_ID="$DIST_ID" ./Scripts/smoke.sh | tee smoke.log
+'''
           }
         }
       }
