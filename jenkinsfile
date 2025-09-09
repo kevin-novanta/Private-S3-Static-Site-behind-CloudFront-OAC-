@@ -108,57 +108,64 @@ fi
     }
 
     stage('Terraform outputs') {
-  steps {
-    script {
-      env.ENV_DIR = "Infra/Terraform/environments/${params.ENV}"
-    }
-    sh script: '''#!/usr/bin/env bash
-set -euo pipefail
-export PATH="$WORKSPACE/.local/bin:$PATH"
-export TF_CLI_ARGS="-no-color"
+      steps {
+        script {
+          env.ENV_DIR = "Infra/Terraform/environments/${params.ENV}"
+        }
+        withCredentials([
+          string(credentialsId: 'JenkinsAccessKey',        variable: 'AWS_ACCESS_KEY_ID'),
+          string(credentialsId: 'JenkinsSecretAccessKey',  variable: 'AWS_SECRET_ACCESS_KEY')
+        ]) {
+          withEnv(['AWS_REGION=us-east-1', 'AWS_DEFAULT_REGION=us-east-1']) {
+            sh script: '''#!/usr/bin/env bash
+            set -euo pipefail
+            export PATH="$WORKSPACE/.local/bin:$PATH"
+            export TF_CLI_ARGS="-no-color"
 
-cd "${ENV_DIR}"
-terraform init -input=false -upgrade 1>&2
+            cd "${ENV_DIR}"
+            terraform init -input=false -upgrade 1>&2
 
-# Export outputs to JSON, then to simple key=value properties
-terraform output -json > tf-outputs.json
+            # Export outputs to JSON, then to simple key=value properties
+            terraform output -json > tf-outputs.json
 
-# Expecting keys: s3_bucket_name, cloudfront_distribution_id, and either cdn_hostname or cdn_url
-jq -r '
-  to_entries
-  | map("\\(.key)=\\(.value.value)")
-  | .[]
-' tf-outputs.json > tf-out.properties
+            # Expecting keys: s3_bucket_name, cloudfront_distribution_id, and either cdn_hostname or cdn_url
+            jq -r '
+              to_entries
+              | map("\\(.key)=\\(.value.value)")
+              | .[]
+            ' tf-outputs.json > tf-out.properties
 
-# Move properties file to workspace root for Jenkins steps
-cp tf-out.properties "$WORKSPACE/tf-out.properties"
-'''
-    // Read properties into env vars
-    script {
-      def props = readProperties file: 'tf-out.properties'
+            # Move properties file to workspace root for Jenkins steps
+            cp tf-out.properties "$WORKSPACE/tf-out.properties"
+            '''
+          }
+        }
+        // Read properties into env vars
+        script {
+          def props = readProperties file: 'tf-out.properties'
 
-      // prefer cdn_hostname; fall back to cdn_url
-      def cdnHost = (props['cdn_hostname'] ?: '').trim()
-      if (!cdnHost) {
-        def cdnUrl = (props['cdn_url'] ?: '').trim()
-        if (cdnUrl) {
-          cdnHost = cdnUrl.replaceFirst('^https?://', '').replaceAll('/$', '')
+          // prefer cdn_hostname; fall back to cdn_url
+          def cdnHost = (props['cdn_hostname'] ?: '').trim()
+          if (!cdnHost) {
+            def cdnUrl = (props['cdn_url'] ?: '').trim()
+            if (cdnUrl) {
+              cdnHost = cdnUrl.replaceFirst('^https?://', '').replaceAll('/$', '')
+            }
+          }
+
+          env.SITE_BUCKET = (props['s3_bucket_name'] ?: '').trim()
+          env.DIST_ID     = (props['cloudfront_distribution_id'] ?: '').trim()
+          env.CDN_HOST    = cdnHost
+
+          echo "Resolved: bucket=${env.SITE_BUCKET}, dist=${env.DIST_ID}, cdn=${env.CDN_HOST}, envdir=${env.ENV_DIR}"
         }
       }
-
-      env.SITE_BUCKET = (props['s3_bucket_name'] ?: '').trim()
-      env.DIST_ID     = (props['cloudfront_distribution_id'] ?: '').trim()
-      env.CDN_HOST    = cdnHost
-
-      echo "Resolved: bucket=${env.SITE_BUCKET}, dist=${env.DIST_ID}, cdn=${env.CDN_HOST}, envdir=${env.ENV_DIR}"
+      post {
+        always {
+          archiveArtifacts artifacts: 'tf-outputs.json, tf-out.properties', onlyIfSuccessful: false, allowEmptyArchive: true
+        }
+      }
     }
-  }
-  post {
-    always {
-      archiveArtifacts artifacts: 'tf-outputs.json, tf-out.properties', onlyIfSuccessful: false, allowEmptyArchive: true
-    }
-  }
-}
 
     stage('Deploy (sync + invalidate + smoke)') {
       steps {
@@ -175,27 +182,25 @@ cp tf-out.properties "$WORKSPACE/tf-out.properties"
           }
 
           // Choose credentials per environment. You already created staging IDs.
-          def keyIdId     = (params.ENV == 'prod') ? 'aws-prod-access-key-id'           : 'aws-staging-access-key-id'
-          def secretKeyId = (params.ENV == 'prod') ? 'aws-prod-secret-access-key'       : 'aws-staging-secret-access-key'
-
           withCredentials([
-            string(credentialsId: keyIdId,     variable: 'AWS_ACCESS_KEY_ID'),
-            string(credentialsId: secretKeyId, variable: 'AWS_SECRET_ACCESS_KEY')
+            string(credentialsId: 'JenkinsAccessKey',        variable: 'AWS_ACCESS_KEY_ID'),
+            string(credentialsId: 'JenkinsSecretAccessKey',  variable: 'AWS_SECRET_ACCESS_KEY')
           ]) {
             sh script: '''#!/usr/bin/env bash
-set -euo pipefail
-export PATH="$WORKSPACE/.local/bin:$PATH"
-export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+            set -euo pipefail
+            export PATH="$WORKSPACE/.local/bin:$PATH"
+            export AWS_REGION="${AWS_REGION:-us-east-1}"
+            export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
 
-aws s3 sync site/ "s3://${SITE_BUCKET}" --delete
+            aws s3 sync site/ "s3://${SITE_BUCKET}" --delete
 
-aws cloudfront create-invalidation \
-  --distribution-id "$DIST_ID" \
-  --paths "/*"
+            aws cloudfront create-invalidation \
+              --distribution-id "$DIST_ID" \
+              --paths "/*"
 
-chmod +x Scripts/smoke.sh
-CDN_HOST="${CDN_HOST}" SITE_BUCKET="$SITE_BUCKET" DIST_ID="$DIST_ID" ./Scripts/smoke.sh | tee smoke.log
-'''
+            chmod +x Scripts/smoke.sh
+            CDN_HOST="${CDN_HOST}" SITE_BUCKET="$SITE_BUCKET" DIST_ID="$DIST_ID" ./Scripts/smoke.sh | tee smoke.log
+            '''
           }
         }
       }
