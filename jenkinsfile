@@ -1,0 +1,92 @@
+pipeline {
+  agent any
+
+  environment {
+    AWS_REGION = 'us-east-1'
+    AWS_ACCESS_KEY_ID     = credentials('aws-staging-access-key-id')
+    AWS_SECRET_ACCESS_KEY = credentials('aws-staging-secret-access-key')
+  }
+
+  stages {
+    stage('Checkout') {
+      steps { checkout scm }
+    }
+
+    stage('Tools (aws + terraform)') {
+      steps {
+        sh '''
+          set -e
+          if ! command -v unzip >/dev/null 2>&1; then sudo apt-get update -y && sudo apt-get install -y unzip curl jq; fi
+
+          # AWS CLI v2
+          if ! command -v aws >/dev/null 2>&1; then
+            curl -sS "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o awscliv2.zip || \
+            curl -sS "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
+            unzip -q awscliv2.zip
+            sudo ./aws/install
+            aws --version
+          fi
+
+          # Terraform (single binary install)
+          if ! command -v terraform >/dev/null 2>&1; then
+            TF_VERSION=1.8.5
+            ARCH=$(uname -m)
+            case "$ARCH" in
+              x86_64) TF_ZIP="terraform_${TF_VERSION}_linux_amd64.zip" ;;
+              aarch64|arm64) TF_ZIP="terraform_${TF_VERSION}_linux_arm64.zip" ;;
+              *) echo "Unsupported arch $ARCH"; exit 1 ;;
+            esac
+            curl -sS -L "https://releases.hashicorp.com/terraform/${TF_VERSION}/${TF_ZIP}" -o tf.zip
+            sudo unzip -o tf.zip -d /usr/local/bin
+            terraform -version
+          fi
+        '''
+      }
+    }
+
+    stage('Resolve Terraform outputs') {
+      steps {
+        sh '''
+          set -e
+          cd Infra/Terraform/environments/staging
+          terraform init -input=false -upgrade
+          echo "BUCKET=$(terraform output -raw s3_bucket_name)" >  $WORKSPACE/env.out
+          echo "DISTID=$(terraform output -raw cloudfront_distribution_id)" >> $WORKSPACE/env.out
+          echo "CDN=$(terraform output -raw cdn_url)" >> $WORKSPACE/env.out
+        '''
+        script {
+          def props = readProperties file: 'env.out'
+          env.BUCKET = props['BUCKET']
+          env.DISTID = props['DISTID']
+          env.CDN    = props['CDN']
+        }
+      }
+    }
+
+    stage('Sync site to S3') {
+      steps {
+        sh 'aws s3 sync site/ "s3://${BUCKET}" --delete'
+      }
+    }
+
+    stage('Invalidate CloudFront') {
+      steps {
+        sh 'aws cloudfront create-invalidation --distribution-id "$DISTID" --paths "/*"'
+      }
+    }
+
+    stage('Smoke Test') {
+      steps {
+        sh '''
+          chmod +x Scripts/smoke.sh
+          CDN_HOST="${CDN#https://}" SITE_BUCKET="$BUCKET" DIST_ID="$DISTID" ./Scripts/smoke.sh
+        '''
+      }
+    }
+  }
+
+  post {
+    success { echo '✅ Deploy + smoke passed' }
+    failure { echo '❌ Pipeline failed — check stage logs' }
+  }
+}
