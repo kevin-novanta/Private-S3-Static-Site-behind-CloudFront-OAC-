@@ -8,6 +8,7 @@ pipeline {
 
   environment {
     AWS_REGION = 'us-east-1'
+    TF_CLI_ARGS = '-no-color'
   }
 
   stages {
@@ -113,19 +114,39 @@ fi
         sh script: '''#!/usr/bin/env bash
 set -euo pipefail
 export PATH="$WORKSPACE/.local/bin:$PATH"
+# Force no color from Terraform as well
+export TF_CLI_ARGS="-no-color"
+
 cd "${ENV_DIR}"
-          terraform init -input=false -upgrade
-          echo "BUCKET=$(terraform output -raw s3_bucket_name)"                 >  "$WORKSPACE/env.out"
-          echo "DISTID=$(terraform output -raw cloudfront_distribution_id)"    >> "$WORKSPACE/env.out"
-          echo "CDN=$(terraform output -raw cdn_url)"                          >> "$WORKSPACE/env.out"
-          echo "ENV_DIR=${ENV_DIR}"                                            >> "$WORKSPACE/env.out"
-        '''
+terraform init -input=false -upgrade 1>&2
+
+# Capture raw outputs (no color)
+BUCKET="$(terraform output -raw s3_bucket_name)"
+DISTID="$(terraform output -raw cloudfront_distribution_id)"
+CDN="$(terraform output -raw cdn_url)"
+
+# Write a simple env file
+printf 'BUCKET=%s\nDISTID=%s\nCDN=%s\nENV_DIR=%s\n' \
+  "$BUCKET" "$DISTID" "$CDN" "${ENV_DIR}" > "$WORKSPACE/env.out"
+'''
+        // Read and sanitize without readProperties (strip ANSI & non-printables)
         script {
-          def props = readProperties file: 'env.out'
-          env.BUCKET  = props['BUCKET']
-          env.DISTID  = props['DISTID']
-          env.CDN     = props['CDN']
-          env.ENV_DIR = props['ENV_DIR']
+          def ansiStrip = { s ->
+            if (s == null) return s
+            s.replaceAll(/\u001B\[[;\d]*m/, '')
+             .replaceAll(/[^\x20-\x7E]/, '')
+             .trim()
+          }
+
+          def text = readFile 'env.out'
+          text.split('\n').each { line ->
+            if (line?.trim() && line.contains('=')) {
+              def idx = line.indexOf('=')
+              def k = line.substring(0, idx)
+              def v = line.substring(idx + 1)
+              env[k] = ansiStrip(v)
+            }
+          }
           echo "Resolved: bucket=${env.BUCKET}, dist=${env.DISTID}, cdn=${env.CDN}, envdir=${env.ENV_DIR}"
         }
       }
@@ -134,8 +155,18 @@ cd "${ENV_DIR}"
     stage('Deploy (sync + invalidate + smoke)') {
       steps {
         script {
+          // Sanity checks to avoid bad values slipping through
+          if (!(env.BUCKET ==~ "^[a-z0-9.\\-_]{3,255}\$")) {
+            error "S3 bucket name looks invalid: '${env.BUCKET}'"
+          }
+          if (!(env.CDN?.startsWith('https://'))) {
+            error "CDN URL looks invalid: '${env.CDN}'"
+          }
+          if (!(env.DISTID ==~ "^[A-Z0-9]{13,}\$")) {
+            error "Distribution ID looks invalid: '${env.DISTID}'"
+          }
+
           // Choose credentials per environment. You already created staging IDs.
-          // If you add prod later, create matching Jenkins credentials with these IDs.
           def keyIdId     = (params.ENV == 'prod') ? 'aws-prod-access-key-id'           : 'aws-staging-access-key-id'
           def secretKeyId = (params.ENV == 'prod') ? 'aws-prod-secret-access-key'       : 'aws-staging-secret-access-key'
 
