@@ -164,13 +164,13 @@ cp tf-out.properties "$WORKSPACE/tf-out.properties"
       steps {
         script {
           // Sanity checks
-          if (!(env.SITE_BUCKET ==~ "^[a-z0-9.\\-_]{3,255}$")) {
+          if (!(env.SITE_BUCKET ==~ ~/^[a-z0-9.\-_]{3,255}$/)) {
             error "S3 bucket name looks invalid: '${env.SITE_BUCKET}'"
           }
-          if (!(env.DIST_ID ==~ "^[A-Z0-9]{13,}$")) {
+          if (!(env.DIST_ID ==~ ~/^[A-Z0-9]{13,}$/)) {
             error "Distribution ID looks invalid: '${env.DIST_ID}'"
           }
-          if (!env.CDN_HOST || !(env.CDN_HOST ==~ "^[A-Za-z0-9.-]+\$")) {
+          if (!env.CDN_HOST || !(env.CDN_HOST ==~ ~/^[A-Za-z0-9.-]+$/)) {
             error "CDN host looks invalid: '${env.CDN_HOST}'"
           }
 
